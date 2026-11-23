@@ -1,0 +1,244 @@
+.nexora-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+}
+
+.nexora-frame {
+  width: 100%;
+  max-width: 720px;
+  background-color: var(--bg-panel);
+  border: 1px solid var(--border-tech);
+  box-shadow:
+    0 0 0 1px rgba(34, 211, 238, 0.14),
+    0 20px 50px rgba(0, 0, 0, 0.55);
+  padding: 2rem;
+  position: relative;
+}
+
+.nexora-frame::before,
+.nexora-frame::after {
+  content: "";
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  background-color: var(--accent-cyan);
+}
+
+.nexora-frame::before {
+  top: -1px;
+  left: -1px;
+}
+
+.nexora-frame::after {
+  bottom: -1px;
+  right: -1px;
+}
+
+.nexora-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  padding-bottom: 1.5rem;
+  border-bottom: 1px solid var(--border-tech);
+}
+
+.nexora-brand {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.nexora-emblem {
+  width: 56px;
+  height: 56px;
+  flex-shrink: 0;
+  border: 1px solid var(--border-tech);
+  background-color: var(--bg-obsidian);
+  padding: 6px;
+}
+
+.nexora-title {
+  margin: 0;
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: var(--text-primary);
+}
+
+.nexora-tagline {
+  margin: 0.25rem 0 0;
+  font-size: 0.92rem;
+  color: var(--text-secondary);
+}
+
+.nexora-badge {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--border-tech);
+  background-color: var(--bg-obsidian);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  white-space: nowrap;
+}
+
+.nexora-badge[data-state="ready"] {
+  border-color: rgba(16, 185, 129, 0.5);
+  color: var(--accent-emerald);
+}
+
+.nexora-badge[data-state="loading"] {
+  border-color: rgba(34, 211, 238, 0.45);
+  color: var(--accent-cyan);
+}
+
+.nexora-badge[data-state="offline"] {
+  border-color: rgba(245, 158, 11, 0.5);
+  color: var(--accent-amber);
+}
+
+.nexora-dot {
+  width: 8px;
+  height: 8px;
+  background-color: currentColor;
+  display: inline-block;
+}
+
+.nexora-telemetry {
+  margin-top: 1.5rem;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.telemetry-cell {
+  background-color: var(--bg-obsidian);
+  border: 1px solid var(--border-tech);
+  padding: 0.85rem 1rem;
+}
+
+.telemetry-label {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.telemetry-value {
+  display: block;
+  margin-top: 0.35rem;
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+  color: var(--text-primary);
+}
+
+.modules-section {
+  margin-top: 1.5rem;
+}
+
+.section-title {
+  margin: 0 0 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent-cyan);
+}
+
+.modules-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.module-card {
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border-tech);
+  padding: 0.9rem 1rem;
+}
+
+.module-name {
+  font-family: var(--font-mono);
+  font-size: 0.88rem;
+  color: var(--text-primary);
+}
+
+.module-state {
+  margin-top: 0.35rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+
+.nexora-fallback {
+  margin-top: 1.25rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  background-color: rgba(245, 158, 11, 0.08);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--accent-amber);
+}
+
+.nexora-footer {
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border-tech);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.footer-note {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--text-muted);
+}
+
+.nexora-button {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--bg-obsidian);
+  background-color: var(--accent-cyan);
+  border: 1px solid var(--accent-cyan);
+  padding: 0.55rem 1rem;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.nexora-button:hover:not(:disabled) {
+  background-color: #67e8f9;
+}
+
+.nexora-button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+@media (max-width: 640px) {
+  .nexora-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .nexora-telemetry,
+  .modules-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .nexora-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
