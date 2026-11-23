@@ -1565,21 +1565,36 @@ mod tests {
         assert_eq!(norm_sys32_from_win, r"c:\windows\system32");
         assert!(is_critical_system_path_norm(&norm_sys32_from_win));
 
+        let norm_root_rel_win_from_c =
+            normalize_windows_path_with_base(r"\Windows", Some(Path::new(r"C:\Users")));
+        assert_eq!(norm_root_rel_win_from_c, r"c:\windows");
+        assert!(is_critical_system_path_norm(&norm_root_rel_win_from_c));
+
         let norm_dot_from_c = normalize_windows_path_with_base(".", Some(Path::new(r"C:\")));
         assert_eq!(norm_dot_from_c, r"c:\");
         assert!(is_drive_root_norm(&norm_dot_from_c));
 
         // Direct public API checks using current process CWD (no env::set_current_dir race)
         let cwd = std::env::current_dir().expect("current_dir");
-        assert_eq!(
-            normalize_windows_path(Path::new(".")),
-            normalize_windows_path(&cwd)
-        );
+        let cwd_norm = normalize_windows_path(&cwd);
+        assert_eq!(normalize_windows_path(Path::new(".")), cwd_norm);
         assert!(!is_deletable_path(Path::new("")));
         assert!(!is_deletable_path(Path::new("   ")));
         assert!(!is_deletable_path(Path::new(r"\")));
-        assert!(is_critical_system_path(Path::new(r"\Windows")));
-        assert!(!is_deletable_path(Path::new(r"\Windows")));
+
+        // `\Windows` resolves relative to the current drive (e.g. `D:\Windows` on `D:` CI runners).
+        let cwd_bytes = cwd_norm.as_bytes();
+        if cwd_bytes.len() >= 3 && cwd_bytes[1] == b':' && cwd_bytes[2] == b'\\' {
+            let expected_root_rel_win = format!("{}\\windows", &cwd_norm[..2]);
+            assert_eq!(
+                normalize_windows_path(Path::new(r"\Windows")),
+                expected_root_rel_win
+            );
+            if is_critical_system_path_norm(&expected_root_rel_win) {
+                assert!(is_critical_system_path(Path::new(r"\Windows")));
+                assert!(!is_deletable_path(Path::new(r"\Windows")));
+            }
+        }
     }
 
     #[test]
