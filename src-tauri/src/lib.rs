@@ -1,5 +1,6 @@
 pub mod cleaner;
 pub mod detectors;
+pub mod safety;
 pub mod scanner;
 
 use serde::Serialize;
@@ -34,7 +35,13 @@ fn get_app_status() -> AppStatus {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![get_app_status])
+        .manage(scanner::commands::ScannerState::default())
+        .invoke_handler(tauri::generate_handler![
+            get_app_status,
+            scanner::commands::list_scan_targets,
+            scanner::commands::start_scan,
+            scanner::commands::cancel_scan,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
