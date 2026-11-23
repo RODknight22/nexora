@@ -66,22 +66,36 @@ fn format_extended_from_clean(clean: &str) -> OsString {
     }
 }
 
-/// Strips `\\?\` or converts `\\?\UNC\` back to `\\` for clean display paths.
+fn is_preserved_extended_namespace(rest: &str) -> bool {
+    let bytes = rest.as_bytes();
+    let starts_ci = |prefix: &[u8]| {
+        bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
+    };
+    starts_ci(b"Volume{")
+        || starts_ci(b"GLOBALROOT\\")
+        || rest.eq_ignore_ascii_case("GLOBALROOT")
+        || starts_ci(b"BootPartition\\")
+        || rest.eq_ignore_ascii_case("BootPartition")
+}
+
+/// Strips `\\?\` or converts `\\?\UNC\` back to `\\` for clean display paths,
+/// while preserving `\\?\` for Volume GUID and NT device namespaces (`Volume{...}`,
+/// `GLOBALROOT`, `BootPartition`).
 pub fn strip_extended_prefix(path: &Path) -> String {
     strip_extended_prefix_str(&path.to_string_lossy())
 }
 
 pub fn strip_extended_prefix_str(raw: &str) -> String {
-    if let Some(unc_tail) = raw
-        .strip_prefix("\\\\?\\UNC\\")
-        .or_else(|| raw.strip_prefix("\\\\?\\unc\\"))
-    {
-        format!("\\\\{unc_tail}")
-    } else if let Some(rest) = raw.strip_prefix("\\\\?\\") {
-        rest.to_string()
-    } else {
-        raw.to_string()
+    if let Some(rest) = raw.strip_prefix("\\\\?\\") {
+        if let Some(unc_tail) = strip_unc_prefix(rest) {
+            return format!("\\\\{unc_tail}");
+        }
+        if is_preserved_extended_namespace(rest) {
+            return raw.to_string();
+        }
+        return rest.to_string();
     }
+    raw.to_string()
 }
 
 /// Encodes an `OsStr` as a null-terminated UTF-16 buffer for Win32 wide APIs.
@@ -350,5 +364,42 @@ mod tests {
         );
         assert_eq!(extract_extension("README"), None);
         assert_eq!(extract_extension(".gitignore"), None);
+    }
+
+    #[test]
+    fn strips_mixed_case_unc_prefix_and_preserves_volume_and_device_namespaces() {
+        assert_eq!(
+            strip_extended_prefix_str(r"\\?\Unc\Server\Share\File"),
+            r"\\Server\Share\File"
+        );
+        assert_eq!(
+            strip_extended_prefix_str(r"\\?\uNc\Server\Share\File"),
+            r"\\Server\Share\File"
+        );
+
+        let preserved = [
+            r"\\?\Volume{36d7375e-dea6-4086-a7ce-9e54afa0ccfe}\Windows",
+            r"\\?\Volume{36d7375e-dea6-4086-a7ce-9e54afa0ccfe}\",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume3\Windows",
+            r"\\?\BootPartition\Windows",
+        ];
+        for path_str in preserved {
+            assert_eq!(strip_extended_prefix_str(path_str), path_str);
+            assert_eq!(
+                to_extended_length_path(Path::new(path_str)).to_string_lossy(),
+                path_str
+            );
+        }
+
+        for device_str in [
+            r"\\.\BootPartition\Windows",
+            r"\\.\GLOBALROOT\Device\HarddiskVolume3\Windows",
+            r"\??\GLOBALROOT\Device\HarddiskVolume3\Windows",
+        ] {
+            assert_eq!(
+                to_extended_length_path(Path::new(device_str)).to_string_lossy(),
+                device_str
+            );
+        }
     }
 }

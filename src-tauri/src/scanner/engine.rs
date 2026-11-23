@@ -1226,4 +1226,96 @@ mod tests {
         assert_eq!(json["root"]["children"][0]["isDeletable"], true);
         assert_eq!(json["root"]["children"][0]["isProtected"], false);
     }
+
+    #[test]
+    fn skips_volume_guid_device_and_local_unc_critical_paths_by_default() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetVolumeNameForVolumeMountPointW, QueryDosDeviceW,
+        };
+
+        let c_root_w: Vec<u16> = std::ffi::OsStr::new(r"C:\")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut vol_buf = [0u16; 128];
+        let ok = unsafe {
+            GetVolumeNameForVolumeMountPointW(
+                c_root_w.as_ptr(),
+                vol_buf.as_mut_ptr(),
+                vol_buf.len() as u32,
+            )
+        };
+        assert_ne!(
+            ok, 0,
+            "GetVolumeNameForVolumeMountPointW(C:\\) must succeed"
+        );
+        let vol_len = vol_buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(vol_buf.len());
+        let vol_root = String::from_utf16_lossy(&vol_buf[..vol_len]);
+
+        let c_dev_w: Vec<u16> = std::ffi::OsStr::new("C:")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut dev_buf = [0u16; 512];
+        let dev_len = unsafe {
+            QueryDosDeviceW(c_dev_w.as_ptr(), dev_buf.as_mut_ptr(), dev_buf.len() as u32)
+        };
+        assert_ne!(dev_len, 0, "QueryDosDeviceW(C:) must succeed");
+        let dev_end = dev_buf[..dev_len as usize]
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(dev_len as usize);
+        let nt_dev = String::from_utf16_lossy(&dev_buf[..dev_end]);
+
+        let mut protected_targets = vec![
+            format!("{vol_root}Windows"),
+            format!("{vol_root}Program Files"),
+            format!(r"\\.\GLOBALROOT{nt_dev}\Windows"),
+            format!(r"\\?\GLOBALROOT{nt_dev}\Windows"),
+            format!(r"\??\GLOBALROOT{nt_dev}\Windows"),
+            String::from(r"\\.\BootPartition\Windows"),
+            String::from(r"\\0--1.ipv6-literal.net\C$\Windows"),
+        ];
+
+        if let Ok(comp) = std::env::var("COMPUTERNAME") {
+            let clean = comp.trim();
+            if !clean.is_empty() {
+                protected_targets.push(format!(r"\\{clean}\C$\Windows"));
+                protected_targets.push(format!(r"\\?\UNC\{clean}\C$\Windows"));
+            }
+        }
+
+        let mut tested = 0usize;
+        for target in protected_targets {
+            if std::fs::symlink_metadata(&target).is_err() {
+                continue;
+            }
+            tested += 1;
+            let res = scan_path(
+                String::from("test-protected-namespace"),
+                Path::new(&target),
+                ScanOptions::default(),
+                Arc::new(AtomicBool::new(false)),
+                &NoopProgressSink,
+            )
+            .unwrap_or_else(|e| panic!("protected skip for '{target}' failed: {e}"));
+
+            assert!(res.root.is_protected, "expected isProtected for {target}");
+            assert!(!res.root.is_deletable, "expected !isDeletable for {target}");
+            assert!(
+                res.root.skipped_protected,
+                "expected skippedProtected for {target}"
+            );
+            assert_eq!(res.skipped_protected_count, 1);
+            assert!(res.root.children.is_empty());
+        }
+        assert!(
+            tested >= 5,
+            "expected at least 5 live namespace targets to be verified, got {tested}"
+        );
+    }
 }

@@ -58,7 +58,11 @@ impl ScannerState {
         };
 
         if let Some(id) = scan_id {
-            if let Some(token) = guard.get(id) {
+            let trimmed = id.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            if let Some(token) = guard.get(trimmed) {
                 token.store(true, Ordering::SeqCst);
                 return true;
             }
@@ -212,5 +216,26 @@ mod tests {
             .register(Some(String::from("dup-scan")))
             .expect("id should be reusable after unregister");
         state.unregister("dup-scan", &tok2);
+    }
+
+    #[test]
+    fn scanner_state_cancel_trims_whitespace_and_ignores_blank_id() {
+        let state = ScannerState::default();
+        let (id, tok) = state
+            .register(Some(String::from(" ws-scan ")))
+            .expect("register trimmed id");
+        assert_eq!(id, "ws-scan");
+        assert!(!tok.load(Ordering::Relaxed));
+
+        // Blank/whitespace-only scan_id must return false without cancelling unrelated active scans
+        assert!(!state.cancel(Some("   ")));
+        assert!(!state.cancel(Some("")));
+        assert!(!tok.load(Ordering::Relaxed));
+
+        // Untrimmed matching scan_id cancels cleanly
+        assert!(state.cancel(Some(" ws-scan ")));
+        assert!(tok.load(Ordering::Relaxed));
+
+        state.unregister(&id, &tok);
     }
 }
