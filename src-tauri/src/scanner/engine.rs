@@ -150,6 +150,7 @@ pub fn scan_path(
 
     ctx.emit_now(&display_root, false);
 
+    use std::os::windows::fs::MetadataExt;
     let root_node = if root_meta.is_dir() {
         let root_is_drive = safety::is_drive_root(Path::new(&display_root));
         let root_is_critical = safety::is_critical_system_path(Path::new(&display_root));
@@ -164,6 +165,8 @@ pub fn scan_path(
             let propagate_protected = root_is_critical && !root_is_drive;
             scan_directory(&ctx, &ext_root, &display_root, 0, propagate_protected, true)
         }
+    } else if (root_meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        scan_root_reparse_dir(&ctx, &display_root, &root_meta)
     } else {
         scan_single_root_file(&ctx, &ext_root, &display_root, &root_meta)
     };
@@ -505,6 +508,46 @@ fn process_entry(
     (node, ctx.options.include_files)
 }
 
+fn scan_root_reparse_dir(
+    ctx: &ScanContext<'_>,
+    display_path: &str,
+    meta: &std::fs::Metadata,
+) -> ScanNode {
+    use std::os::windows::fs::MetadataExt;
+
+    let attrs = meta.file_attributes();
+    let is_reparse = meta.file_type().is_symlink()
+        || (attrs & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    let path_obj = Path::new(display_path);
+    let is_protected = safety::is_critical_system_path(path_obj) || safety::is_drive_root(path_obj);
+    let is_deletable = !is_protected && safety::is_deletable_path(path_obj);
+
+    ctx.scanned_dirs.fetch_add(1, Ordering::Relaxed);
+
+    ScanNode {
+        name: extract_node_name(display_path),
+        path: display_path.to_string(),
+        is_dir: true,
+        logical_size: 0,
+        size_on_disk: 0,
+        is_cloud_only: false,
+        is_protected,
+        is_deletable,
+        skipped_protected: false,
+        access_denied: false,
+        is_reparse_point: is_reparse,
+        extension: None,
+        modified_ms: windows_time_to_ms(meta.last_write_time()),
+        accessed_ms: windows_time_to_ms(meta.last_access_time()),
+        file_count: 0,
+        dir_count: 0,
+        cloud_only_count: 0,
+        cloud_only_logical_size: 0,
+        error_count: 0,
+        children: Vec::new(),
+    }
+}
+
 fn scan_single_root_file(
     ctx: &ScanContext<'_>,
     ext_path: &OsStr,
@@ -551,7 +594,6 @@ fn scan_single_root_file(
     let extension = extract_extension(&name);
     let modified_ms = windows_time_to_ms(meta.last_write_time());
     let accessed_ms = windows_time_to_ms(meta.last_access_time());
-    let _ = attrs & FILE_ATTRIBUTE_DIRECTORY;
 
     ScanNode {
         name,
@@ -1058,6 +1100,79 @@ mod tests {
         assert!(!res.root.is_deletable);
         assert!(res.root.skipped_protected);
         assert_eq!(res.skipped_protected_count, 1);
+        assert!(res.root.children.is_empty());
+    }
+
+    #[test]
+    fn skips_critical_system_root_aliases_and_short_names_by_default() {
+        let mut alias_paths = vec![
+            r"\\.\C:\Windows",
+            r"\??\C:\Windows",
+            r"C:\Windows ",
+            r"C:\Windows.",
+        ];
+        if Path::new(r"C:\PROGRA~1").exists() {
+            alias_paths.push(r"C:\PROGRA~1");
+        }
+
+        for raw in alias_paths {
+            let res = scan_path(
+                String::from("test-protected-alias"),
+                Path::new(raw),
+                ScanOptions::default(),
+                Arc::new(AtomicBool::new(false)),
+                &NoopProgressSink,
+            )
+            .unwrap_or_else(|e| panic!("protected skip for '{raw}' failed: {e}"));
+
+            assert!(res.root.is_protected, "expected isProtected for {raw}");
+            assert!(!res.root.is_deletable, "expected !isDeletable for {raw}");
+            assert!(
+                res.root.skipped_protected,
+                "expected skippedProtected for {raw}"
+            );
+            assert_eq!(res.skipped_protected_count, 1);
+            assert!(res.root.children.is_empty());
+        }
+    }
+
+    #[test]
+    fn classifies_directory_junction_as_root_path_without_traversing() {
+        let mut dir = TempTestDir::new("root_junction");
+        let target = dir.path().join("target_dir");
+        fs::create_dir_all(&target).expect("create target dir");
+        write_bytes(&target.join("payload.bin"), 4096);
+
+        let root_junction = dir.path().join("root_junc");
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&root_junction)
+            .arg(&target)
+            .output()
+            .expect("invoke mklink /J");
+        assert!(
+            status.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        dir.register_junction_cleanup(root_junction.clone());
+
+        let res = scan_path(
+            String::from("test-root-junction"),
+            &root_junction,
+            ScanOptions::default(),
+            Arc::new(AtomicBool::new(false)),
+            &NoopProgressSink,
+        )
+        .expect("scan root junction");
+
+        assert_eq!(res.error_count, 0);
+        assert!(res.root.is_dir);
+        assert!(res.root.is_reparse_point);
+        assert_eq!(res.file_count, 0);
+        assert_eq!(res.dir_count, 0);
+        assert_eq!(res.logical_size, 0);
+        assert_eq!(res.size_on_disk, 0);
         assert!(res.root.children.is_empty());
     }
 

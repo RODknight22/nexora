@@ -8,7 +8,27 @@ pub fn to_extended_length_path(path: &Path) -> OsString {
     let raw = path.to_string_lossy();
     let replaced = raw.replace('/', "\\");
 
-    if replaced.starts_with("\\\\?\\") {
+    if let Some(rest) = replaced.strip_prefix("\\\\?\\") {
+        let clean = if let Some(unc_tail) = strip_unc_prefix(rest) {
+            lexical_clean_windows(&format!("\\\\{unc_tail}"), false)
+        } else {
+            lexical_clean_windows(rest, false)
+        };
+        return format_extended_from_clean(&clean);
+    }
+
+    if let Some(rest) = replaced
+        .strip_prefix("\\\\.\\")
+        .or_else(|| replaced.strip_prefix("\\??\\"))
+    {
+        if let Some(unc_tail) = strip_unc_prefix(rest) {
+            let clean = lexical_clean_windows(&format!("\\\\{unc_tail}"), true);
+            return format_extended_from_clean(&clean);
+        }
+        if starts_with_drive_prefix(rest) {
+            let clean = lexical_clean_windows(rest, true);
+            return format_extended_from_clean(&clean);
+        }
         return OsString::from(replaced);
     }
 
@@ -18,8 +38,24 @@ pub fn to_extended_length_path(path: &Path) -> OsString {
         std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(replaced))
     };
 
-    let clean = lexical_clean_windows(&abs_path.to_string_lossy().replace('/', "\\"));
+    let clean = lexical_clean_windows(&abs_path.to_string_lossy().replace('/', "\\"), true);
+    format_extended_from_clean(&clean)
+}
 
+fn strip_unc_prefix(s: &str) -> Option<&str> {
+    if s.len() >= 4 && s[..4].eq_ignore_ascii_case("UNC\\") {
+        Some(&s[4..])
+    } else {
+        None
+    }
+}
+
+fn starts_with_drive_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn format_extended_from_clean(clean: &str) -> OsString {
     if let Some(unc_tail) = clean.strip_prefix("\\\\") {
         OsString::from(format!("\\\\?\\UNC\\{unc_tail}"))
     } else {
@@ -84,7 +120,7 @@ pub fn join_extended_path(parent: &OsStr, child_name: &str) -> OsString {
     }
 }
 
-fn lexical_clean_windows(raw: &str) -> String {
+fn lexical_clean_windows(raw: &str, trim_win32_trailing: bool) -> String {
     let bytes = raw.as_bytes();
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         let drive = &raw[..2];
@@ -98,7 +134,15 @@ fn lexical_clean_windows(raw: &str) -> String {
                 stack.pop();
                 continue;
             }
-            stack.push(seg);
+            let cleaned = if trim_win32_trailing {
+                seg.trim_end_matches([' ', '.'])
+            } else {
+                seg
+            };
+            if cleaned.is_empty() {
+                continue;
+            }
+            stack.push(cleaned);
         }
         if stack.is_empty() {
             return format!("{drive}\\");
@@ -108,8 +152,18 @@ fn lexical_clean_windows(raw: &str) -> String {
 
     if let Some(unc) = raw.strip_prefix("\\\\") {
         let mut parts = unc.trim_start_matches('\\').splitn(3, '\\');
-        let server = parts.next().unwrap_or("");
-        let share = parts.next().unwrap_or("");
+        let raw_server = parts.next().unwrap_or("");
+        let raw_share = parts.next().unwrap_or("");
+        let server = if trim_win32_trailing {
+            raw_server.trim_end_matches([' ', '.'])
+        } else {
+            raw_server
+        };
+        let share = if trim_win32_trailing {
+            raw_share.trim_end_matches([' ', '.'])
+        } else {
+            raw_share
+        };
         let rest = parts.next().unwrap_or("");
         let mut stack: Vec<&str> = Vec::new();
         for seg in rest.split('\\') {
@@ -120,7 +174,15 @@ fn lexical_clean_windows(raw: &str) -> String {
                 stack.pop();
                 continue;
             }
-            stack.push(seg);
+            let cleaned = if trim_win32_trailing {
+                seg.trim_end_matches([' ', '.'])
+            } else {
+                seg
+            };
+            if cleaned.is_empty() {
+                continue;
+            }
+            stack.push(cleaned);
         }
         if stack.is_empty() {
             return format!("\\\\{server}\\{share}");
@@ -157,6 +219,42 @@ mod tests {
         assert_eq!(
             strip_extended_prefix(Path::new(&ext_unc)),
             r"\\Server\Share\Folder\item.bin"
+        );
+    }
+
+    #[test]
+    fn normalizes_device_nt_extended_and_trailing_win32_paths() {
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\\.\C:\Windows")).to_string_lossy(),
+            r"\\?\C:\Windows"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\??\C:\Windows")).to_string_lossy(),
+            r"\\?\C:\Windows"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\\.\UNC\Server\Share\Sub")).to_string_lossy(),
+            r"\\?\UNC\Server\Share\Sub"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\\?\C:\Users\..\Windows")).to_string_lossy(),
+            r"\\?\C:\Windows"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\\?\UNC\Server\Share\a\..\b")).to_string_lossy(),
+            r"\\?\UNC\Server\Share\b"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"C:\Windows ")).to_string_lossy(),
+            r"\\?\C:\Windows"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"C:\Windows.")).to_string_lossy(),
+            r"\\?\C:\Windows"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"C:\Windows.old")).to_string_lossy(),
+            r"\\?\C:\Windows.old"
         );
     }
 

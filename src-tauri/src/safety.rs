@@ -1,9 +1,19 @@
 use std::path::Path;
 
+#[cfg(windows)]
+use std::ffi::OsString;
+#[cfg(windows)]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+
 /// Normalizes a Windows path for consistent comparisons and protection checks:
-/// - Strips `\\?\` and converts `\\?\UNC\` to `\\`
+/// - Strips `\\?\`, `\\.\`, `\??\` and converts `UNC\` forms to `\\`
 /// - Converts `/` to `\`
+/// - Maps loopback administrative shares (`\\localhost\<drive>$`, `\\127.0.0.1\<drive>$`) to `<drive>:\`
 /// - Resolves `.` and `..` components without escaping drive/UNC roots
+/// - Strips Win32 trailing spaces and dots from non-root segments (preserving `Windows.old`)
+/// - Resolves NTFS 8.3 short names (`~`) for existing paths via `GetLongPathNameW`
 /// - Trims trailing `\` except for drive roots (e.g. `c:\`)
 /// - Lowercases ASCII/Unicode characters
 pub fn normalize_windows_path(path: &Path) -> String {
@@ -12,17 +22,24 @@ pub fn normalize_windows_path(path: &Path) -> String {
 }
 
 pub fn normalize_windows_path_str(raw: &str) -> String {
+    let lexical = lexical_normalize_windows_str(raw);
+    if lexical.is_empty() {
+        return lexical;
+    }
+
+    #[cfg(windows)]
+    if lexical.contains('~') && is_drive_or_unc_path(&lexical) {
+        if let Some(resolved) = resolve_long_path_windows(&lexical) {
+            return lexical_normalize_windows_str(&resolved);
+        }
+    }
+
+    lexical
+}
+
+fn lexical_normalize_windows_str(raw: &str) -> String {
     let replaced = raw.replace('/', "\\");
-    let stripped = if let Some(unc_rest) = replaced
-        .strip_prefix("\\\\?\\UNC\\")
-        .or_else(|| replaced.strip_prefix("\\\\?\\unc\\"))
-    {
-        format!("\\\\{unc_rest}")
-    } else if let Some(rest) = replaced.strip_prefix("\\\\?\\") {
-        rest.to_string()
-    } else {
-        replaced
-    };
+    let stripped = strip_namespace_prefix(&replaced);
 
     let (prefix, remainder, rooted) = split_windows_prefix(&stripped);
     let mut stack: Vec<String> = Vec::new();
@@ -43,7 +60,11 @@ pub fn normalize_windows_path_str(raw: &str) -> String {
             }
             continue;
         }
-        stack.push(segment.to_lowercase());
+        let cleaned = segment.trim_end_matches([' ', '.']);
+        if cleaned.is_empty() {
+            continue;
+        }
+        stack.push(cleaned.to_lowercase());
     }
 
     if prefix.is_empty() {
@@ -55,6 +76,18 @@ pub fn normalize_windows_path_str(raw: &str) -> String {
     } else {
         format!("{prefix}\\{}", stack.join("\\"))
     }
+}
+
+fn strip_namespace_prefix(s: &str) -> String {
+    for prefix in ["\\\\?\\", "\\\\.\\", "\\??\\"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("UNC\\") {
+                return format!("\\\\{}", &rest[4..]);
+            }
+            return rest.to_string();
+        }
+    }
+    s.to_string()
 }
 
 fn split_windows_prefix(s: &str) -> (String, &str, bool) {
@@ -69,15 +102,23 @@ fn split_windows_prefix(s: &str) -> (String, &str, bool) {
     if let Some(unc_body) = s.strip_prefix("\\\\") {
         let trimmed = unc_body.trim_start_matches('\\');
         let mut parts = trimmed.splitn(3, '\\');
-        let server = parts.next().unwrap_or("");
-        let share = parts.next().unwrap_or("");
+        let server = parts.next().unwrap_or("").trim_end_matches([' ', '.']);
+        let share = parts.next().unwrap_or("").trim_end_matches([' ', '.']);
         let rest = parts.next().unwrap_or("");
         if !server.is_empty() && !share.is_empty() {
-            return (
-                format!("\\\\{}\\{}", server.to_lowercase(), share.to_lowercase()),
-                rest,
-                true,
-            );
+            let server_lower = server.to_lowercase();
+            let share_lower = share.to_lowercase();
+            let share_bytes = share_lower.as_bytes();
+            let is_loopback = matches!(server_lower.as_str(), "localhost" | "127.0.0.1" | "::1");
+            if is_loopback
+                && share_bytes.len() == 2
+                && share_bytes[0].is_ascii_alphabetic()
+                && share_bytes[1] == b'$'
+            {
+                let drive = share_bytes[0] as char;
+                return (format!("{drive}:\\"), rest.trim_start_matches('\\'), true);
+            }
+            return (format!("\\\\{server_lower}\\{share_lower}"), rest, true);
         }
         return ("\\\\".to_string(), trimmed, true);
     }
@@ -89,17 +130,83 @@ fn split_windows_prefix(s: &str) -> (String, &str, bool) {
     (String::new(), s, false)
 }
 
-/// Returns true if the path represents a Windows drive root such as `C:\` or `D:\`.
-pub fn is_drive_root(path: &Path) -> bool {
-    let norm = normalize_windows_path(path);
+#[cfg(windows)]
+fn is_drive_or_unc_path(norm: &str) -> bool {
+    let bytes = norm.as_bytes();
+    (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\')
+        || norm.starts_with("\\\\")
+}
+
+#[cfg(windows)]
+fn to_extended_win32_str(norm: &str) -> String {
+    if let Some(unc_tail) = norm.strip_prefix("\\\\") {
+        format!("\\\\?\\UNC\\{unc_tail}")
+    } else {
+        format!("\\\\?\\{norm}")
+    }
+}
+
+#[cfg(windows)]
+fn call_get_long_path_name(norm_candidate: &str) -> Option<String> {
+    let ext = to_extended_win32_str(norm_candidate);
+    let wide: Vec<u16> = OsString::from(ext)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut buf = vec![0u16; wide.len().max(260)];
+    let mut len = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if len == 0 {
+        return None;
+    }
+    if (len as usize) >= buf.len() {
+        buf.resize((len as usize) + 1, 0);
+        len = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+        if len == 0 || (len as usize) >= buf.len() {
+            return None;
+        }
+    }
+
+    let resolved = OsString::from_wide(&buf[..len as usize]);
+    Some(resolved.to_string_lossy().into_owned())
+}
+
+#[cfg(windows)]
+fn resolve_long_path_windows(lexical: &str) -> Option<String> {
+    if let Some(full) = call_get_long_path_name(lexical) {
+        return Some(full);
+    }
+
+    // Walk up parent boundaries so existing short-name ancestors (e.g. `C:\PROGRA~1\NewDir`)
+    // still resolve even when the leaf does not exist on disk.
+    let mut split_pos = lexical.len();
+    while let Some(slash_idx) = lexical[..split_pos].rfind('\\') {
+        let prefix = &lexical[..slash_idx];
+        if prefix.len() <= 3 || !prefix.contains('~') {
+            break;
+        }
+        if let Some(resolved_prefix) = call_get_long_path_name(prefix) {
+            let tail = &lexical[slash_idx..];
+            return Some(format!("{resolved_prefix}{tail}"));
+        }
+        split_pos = slash_idx;
+    }
+
+    None
+}
+
+fn is_drive_root_norm(norm: &str) -> bool {
     let bytes = norm.as_bytes();
     bytes.len() == 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
 }
 
-/// Returns true if `path` is a critical system directory (or inside one) or the system/drive root (`C:\`).
-/// Uses component-boundary matching so `C:\WindowsBackup` is NOT matched as `C:\Windows`.
-pub fn is_critical_system_path(path: &Path) -> bool {
+/// Returns true if the path represents a Windows drive root such as `C:\` or `D:\`.
+pub fn is_drive_root(path: &Path) -> bool {
     let norm = normalize_windows_path(path);
+    is_drive_root_norm(&norm)
+}
+
+fn is_critical_system_path_norm(norm: &str) -> bool {
     if norm.is_empty() {
         return false;
     }
@@ -116,7 +223,7 @@ pub fn is_critical_system_path(path: &Path) -> bool {
         }
     }
 
-    if exact_roots.contains(&norm) {
+    if exact_roots.contains(&norm.to_string()) {
         return true;
     }
 
@@ -155,9 +262,21 @@ pub fn is_critical_system_path(path: &Path) -> bool {
     })
 }
 
-/// Returns true if the path is safe to consider for deletion (i.e. not a critical system path).
+/// Returns true if `path` is a critical system directory (or inside one) or the system/drive root (`C:\`).
+/// Uses component-boundary matching so `C:\WindowsBackup` is NOT matched as `C:\Windows`.
+pub fn is_critical_system_path(path: &Path) -> bool {
+    let norm = normalize_windows_path(path);
+    is_critical_system_path_norm(&norm)
+}
+
+/// Returns true if the path is safe to consider for deletion (i.e. non-empty, not a drive root,
+/// and not a critical system path).
 pub fn is_deletable_path(path: &Path) -> bool {
-    !is_critical_system_path(path)
+    let norm = normalize_windows_path(path);
+    if norm.is_empty() || is_drive_root_norm(&norm) {
+        return false;
+    }
+    !is_critical_system_path_norm(&norm)
 }
 
 #[cfg(test)]
@@ -223,5 +342,77 @@ mod tests {
         assert!(is_drive_root(Path::new(r"C:\")));
         assert!(is_drive_root(Path::new(r"\\?\D:\")));
         assert!(!is_drive_root(Path::new(r"C:\Users")));
+    }
+
+    #[test]
+    fn blocks_device_nt_trailing_dot_space_and_loopback_share_bypasses() {
+        for critical_bypass in [
+            r"\\.\C:\Windows",
+            r"\??\C:\Windows",
+            r"\\.\C:\",
+            r"\??\C:\",
+            r"\\.\UNC\localhost\C$\Windows",
+            r"\??\UNC\127.0.0.1\C$\Windows",
+            r"C:\Windows ",
+            r"C:\Windows.",
+            r"C:\Windows . .",
+            r"C:\Users\.\..\Windows ",
+            r"\\localhost\C$\Windows",
+            r"\\127.0.0.1\C$\Windows",
+            r"\\?\UNC\localhost\C$\Windows",
+            r"\\?\UNC\127.0.0.1\C$\Windows",
+            r"\\localhost\C$",
+        ] {
+            assert!(
+                is_critical_system_path(Path::new(critical_bypass)),
+                "expected critical system path for {critical_bypass}"
+            );
+            assert!(
+                !is_deletable_path(Path::new(critical_bypass)),
+                "expected non-deletable path for {critical_bypass}"
+            );
+        }
+
+        assert_eq!(
+            normalize_windows_path(Path::new(r"C:\Windows.old")),
+            r"c:\windows.old"
+        );
+        assert!(!is_critical_system_path(Path::new(r"C:\Windows.old")));
+        assert!(is_deletable_path(Path::new(r"C:\Windows.old")));
+        assert!(is_deletable_path(Path::new(r"C:\WindowsBackup")));
+        assert!(is_deletable_path(Path::new(r"D:\Data")));
+        assert!(is_deletable_path(Path::new(r"\\localhost\D$\Data")));
+
+        assert!(!is_deletable_path(Path::new(r"D:\")));
+        assert!(!is_deletable_path(Path::new(r"D:")));
+        assert!(!is_deletable_path(Path::new(r"\\localhost\D$\")));
+        assert!(!is_deletable_path(Path::new("")));
+        assert!(!is_deletable_path(Path::new("   ")));
+    }
+
+    #[test]
+    fn resolves_existing_ntfs_8_3_short_names_and_falls_back_gracefully() {
+        let short_cases = [
+            (r"C:\PROGRA~1", r"c:\program files"),
+            (r"C:\PROGRA~2", r"c:\program files (x86)"),
+            (r"C:\PROGRA~3", r"c:\programdata"),
+        ];
+
+        for (short_path, expected_norm) in short_cases {
+            if Path::new(short_path).exists() {
+                assert_eq!(normalize_windows_path(Path::new(short_path)), expected_norm);
+                assert!(is_critical_system_path(Path::new(short_path)));
+                assert!(!is_deletable_path(Path::new(short_path)));
+
+                let nested_nonexistent = format!(r"{short_path}\NonExistentSub\item.bin");
+                assert!(is_critical_system_path(Path::new(&nested_nonexistent)));
+                assert!(!is_deletable_path(Path::new(&nested_nonexistent)));
+            }
+        }
+
+        // Non-existent short-name path falls back cleanly without crashing
+        let fallback = normalize_windows_path(Path::new(r"C:\NONEXI~1\Sub"));
+        assert_eq!(fallback, r"c:\nonexi~1\sub");
+        assert!(!is_critical_system_path(Path::new(r"C:\NONEXI~1\Sub")));
     }
 }

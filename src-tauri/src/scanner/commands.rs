@@ -18,17 +18,38 @@ pub struct ScannerState {
 }
 
 impl ScannerState {
-    pub fn register(&self, requested_id: Option<String>) -> (String, Arc<AtomicBool>) {
-        let seq = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let scan_id = requested_id
+    pub fn register(
+        &self,
+        requested_id: Option<String>,
+    ) -> Result<(String, Arc<AtomicBool>), String> {
+        let custom_id = requested_id
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("scan-{seq}"));
+            .filter(|s| !s.is_empty());
+
+        let mut guard = self
+            .active_scans
+            .lock()
+            .map_err(|_| String::from("No se pudo acceder al estado de escaneos activos."))?;
+
+        let scan_id = match custom_id {
+            Some(id) => {
+                if guard.contains_key(&id) {
+                    return Err(format!("Ya existe un escaneo activo con id '{id}'."));
+                }
+                id
+            }
+            None => loop {
+                let seq = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+                let candidate = format!("scan-{seq}");
+                if !guard.contains_key(&candidate) {
+                    break candidate;
+                }
+            },
+        };
+
         let cancel_token = Arc::new(AtomicBool::new(false));
-        if let Ok(mut guard) = self.active_scans.lock() {
-            guard.insert(scan_id.clone(), Arc::clone(&cancel_token));
-        }
-        (scan_id, cancel_token)
+        guard.insert(scan_id.clone(), Arc::clone(&cancel_token));
+        Ok((scan_id, cancel_token))
     }
 
     pub fn cancel(&self, scan_id: Option<&str>) -> bool {
@@ -53,9 +74,13 @@ impl ScannerState {
         true
     }
 
-    pub fn unregister(&self, scan_id: &str) {
+    pub fn unregister(&self, scan_id: &str, cancel_token: &Arc<AtomicBool>) {
         if let Ok(mut guard) = self.active_scans.lock() {
-            guard.remove(scan_id);
+            if let Some(existing) = guard.get(scan_id) {
+                if Arc::ptr_eq(existing, cancel_token) {
+                    guard.remove(scan_id);
+                }
+            }
         }
     }
 }
@@ -92,7 +117,7 @@ pub async fn start_scan(
         return Err(String::from("La ruta de escaneo no puede estar vacía."));
     }
 
-    let (scan_id, cancel_token) = state.register(request.scan_id);
+    let (scan_id, cancel_token) = state.register(request.scan_id)?;
     let options = request.options.unwrap_or_default();
     let target_path = PathBuf::from(trimmed_path);
 
@@ -102,12 +127,19 @@ pub async fn start_scan(
     };
 
     let scan_id_for_task = scan_id.clone();
+    let token_for_task = Arc::clone(&cancel_token);
     let join_result = tauri::async_runtime::spawn_blocking(move || {
-        scan_path(scan_id_for_task, &target_path, options, cancel_token, &sink)
+        scan_path(
+            scan_id_for_task,
+            &target_path,
+            options,
+            token_for_task,
+            &sink,
+        )
     })
     .await;
 
-    state.unregister(&scan_id);
+    state.unregister(&scan_id, &cancel_token);
 
     match join_result {
         Ok(res) => res,
@@ -130,8 +162,10 @@ mod tests {
     #[test]
     fn scanner_state_registers_cancels_and_unregisters_tokens() {
         let state = ScannerState::default();
-        let (id1, tok1) = state.register(None);
-        let (id2, tok2) = state.register(Some(String::from("custom-scan")));
+        let (id1, tok1) = state.register(None).expect("register auto id");
+        let (id2, tok2) = state
+            .register(Some(String::from("custom-scan")))
+            .expect("register custom id");
 
         assert_ne!(id1, id2);
         assert_eq!(id2, "custom-scan");
@@ -147,8 +181,36 @@ mod tests {
         assert!(state.cancel(None));
         assert!(tok1.load(Ordering::Relaxed));
 
-        state.unregister(&id1);
-        state.unregister(&id2);
+        state.unregister(&id1, &tok1);
+        state.unregister(&id2, &tok2);
         assert!(!state.cancel(None));
+    }
+
+    #[test]
+    fn scanner_state_rejects_duplicate_active_id_and_guards_unregister_by_ptr() {
+        let state = ScannerState::default();
+        let (id, tok1) = state
+            .register(Some(String::from("dup-scan")))
+            .expect("initial registration succeeds");
+
+        let dup_err = state
+            .register(Some(String::from("dup-scan")))
+            .expect_err("duplicate active scan_id must be rejected");
+        assert!(dup_err.contains("dup-scan"));
+        assert!(!tok1.load(Ordering::Relaxed));
+
+        // Stale or mismatched token cannot unregister the active scan
+        let stale_token = Arc::new(AtomicBool::new(false));
+        state.unregister(&id, &stale_token);
+        assert!(state.cancel(Some("dup-scan")));
+        assert!(tok1.load(Ordering::Relaxed));
+
+        // Matching token unregisters cleanly, allowing subsequent reuse of the ID
+        state.unregister(&id, &tok1);
+        assert!(!state.cancel(Some("dup-scan")));
+        let (_id_reused, tok2) = state
+            .register(Some(String::from("dup-scan")))
+            .expect("id should be reusable after unregister");
+        state.unregister("dup-scan", &tok2);
     }
 }
