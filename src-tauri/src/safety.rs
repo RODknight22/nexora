@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use std::net::IpAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
@@ -8,13 +10,22 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, HANDLE,
-    INVALID_HANDLE_VALUE,
+    INVALID_HANDLE_VALUE, NO_ERROR,
 };
+#[cfg(windows)]
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    FreeMibTable, GetUnicastIpAddressTable, MIB_UNICASTIPADDRESS_TABLE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::NetworkManagement::NetManagement::NetApiBufferFree;
+#[cfg(windows)]
+use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, GetFinalPathNameByHandleW, GetLogicalDrives, GetLongPathNameW,
-    GetVolumePathNamesForVolumeNameW, QueryDosDeviceW, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, VOLUME_NAME_DOS,
+    GetVolumePathNamesForVolumeNameW, NetShareGetInfo, QueryDosDeviceW, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SHARE_INFO_2,
+    VOLUME_NAME_DOS,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::SystemInformation::{
@@ -27,8 +38,8 @@ use windows_sys::Win32::System::SystemInformation::{
 /// - Resolves non-empty relative paths against the current working directory
 /// - Strips `\\?\`, `\\.\`, `\??\` and converts `UNC\` forms to `\\`
 /// - Converts `/` to `\`
-/// - Maps local-host, loopback (`127.0.0.0/8`, `::1`, `*.ipv6-literal.net`), and local computer-name `<drive>$` shares to `<drive>:\`
-/// - Resolves `.` and `..` components without escaping drive/UNC roots
+/// - Maps local-host, loopback (`127.0.0.0/8`, `::1`, `*.ipv6-literal.net`), local NIC IPs, and local computer-name `<drive>$`, `ADMIN$`, `print$`, and resolvable `$` shares to local paths
+/// - Resolves `.` and `..` components without escaping drive/UNC/share roots
 /// - Strips NTFS ADS (`:stream`) and Win32 trailing spaces/dots from non-root segments (preserving `Windows.old`)
 /// - Resolves NTFS 8.3 short names (`~`) for existing paths via `GetLongPathNameW`
 /// - Trims trailing `\` except for drive roots (e.g. `c:\`)
@@ -240,35 +251,104 @@ fn strip_namespace_prefix(s: &str) -> String {
     s.to_string()
 }
 
-fn is_ipv6_loopback_host(host: &str) -> bool {
+fn parse_ipv6_host(host: &str) -> Option<Ipv6Addr> {
     let inner = host
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(host);
     let no_zone = inner.split('%').next().unwrap_or(inner);
-    let Ok(ip6) = no_zone.parse::<Ipv6Addr>() else {
-        return false;
-    };
-    ip6.is_loopback() || ip6.to_ipv4_mapped().is_some_and(|ip4| ip4.is_loopback())
+    no_zone.parse::<Ipv6Addr>().ok()
 }
 
-fn is_ipv6_literal_net_loopback(host: &str) -> bool {
+fn parse_ipv6_literal_net(host: &str) -> Option<Ipv6Addr> {
     let lower = host.to_ascii_lowercase();
-    let Some(prefix) = lower.strip_suffix(".ipv6-literal.net") else {
-        return false;
-    };
+    let prefix = lower.strip_suffix(".ipv6-literal.net")?;
     // Strip optional zone suffix (`.s<zone>` or `s<zone>`; `s` never appears in IPv6 hex)
     let no_dot_zone = prefix.split(".s").next().unwrap_or(prefix);
     let base = no_dot_zone.split('s').next().unwrap_or(no_dot_zone);
 
     for candidate in [base.replace('-', ":"), base.replace("--", ":")] {
         if let Ok(ip6) = candidate.parse::<Ipv6Addr>() {
-            if ip6.is_loopback() || ip6.to_ipv4_mapped().is_some_and(|ip4| ip4.is_loopback()) {
-                return true;
+            return Some(ip6);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+struct MibTableGuard(*mut MIB_UNICASTIPADDRESS_TABLE);
+
+#[cfg(windows)]
+impl Drop for MibTableGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                FreeMibTable(self.0.cast());
             }
         }
     }
-    false
+}
+
+#[cfg(windows)]
+fn query_local_unicast_ips() -> Vec<IpAddr> {
+    let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+    let status = unsafe { GetUnicastIpAddressTable(AF_UNSPEC, &mut table) };
+    let _guard = MibTableGuard(table);
+    if status != NO_ERROR || table.is_null() {
+        return Vec::new();
+    }
+
+    let num_entries = unsafe { (*table).NumEntries } as usize;
+    if num_entries == 0 {
+        return Vec::new();
+    }
+
+    let rows = unsafe { std::slice::from_raw_parts((*table).Table.as_ptr(), num_entries) };
+    let mut ips = Vec::with_capacity(num_entries);
+    for row in rows {
+        let family = unsafe { row.Address.si_family };
+        if family == AF_INET {
+            let b = unsafe { row.Address.Ipv4.sin_addr.S_un.S_un_b };
+            let ip4 = Ipv4Addr::new(b.s_b1, b.s_b2, b.s_b3, b.s_b4);
+            if !ip4.is_unspecified() {
+                ips.push(IpAddr::V4(ip4));
+            }
+        } else if family == AF_INET6 {
+            let bytes = unsafe { row.Address.Ipv6.sin6_addr.u.Byte };
+            let ip6 = Ipv6Addr::from(bytes);
+            if !ip6.is_unspecified() {
+                ips.push(IpAddr::V6(ip6));
+            }
+        }
+    }
+    ips
+}
+
+fn is_local_ipv6(ip6: Ipv6Addr) -> bool {
+    if ip6.is_loopback() {
+        return true;
+    }
+    if let Some(ip4) = ip6.to_ipv4_mapped() {
+        if ip4.is_loopback() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            return !ip4.is_unspecified() && query_local_unicast_ips().contains(&IpAddr::V4(ip4));
+        }
+        #[cfg(not(windows))]
+        {
+            return false;
+        }
+    }
+    #[cfg(windows)]
+    {
+        !ip6.is_unspecified() && query_local_unicast_ips().contains(&IpAddr::V6(ip6))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 #[cfg(windows)]
@@ -285,7 +365,8 @@ fn query_computer_name(format: COMPUTER_NAME_FORMAT) -> Option<String> {
     if ok == 0 {
         return None;
     }
-    let s = String::from_utf16_lossy(&buf[..size as usize]);
+    let slice = buf.get(..size as usize)?;
+    let s = String::from_utf16_lossy(slice);
     let trimmed = s.trim_end_matches(['\0', ' ', '.']);
     if trimmed.is_empty() {
         None
@@ -325,16 +406,128 @@ fn is_local_host_alias(server: &str) -> bool {
         return true;
     }
     if let Ok(ip4) = host.parse::<Ipv4Addr>() {
-        return ip4.is_loopback();
+        if ip4.is_loopback() {
+            return true;
+        }
+        #[cfg(windows)]
+        if !ip4.is_unspecified() && query_local_unicast_ips().contains(&IpAddr::V4(ip4)) {
+            return true;
+        }
+        return false;
     }
-    if is_ipv6_loopback_host(host) || is_ipv6_literal_net_loopback(host) {
-        return true;
+    if let Some(ip6) = parse_ipv6_host(host) {
+        return is_local_ipv6(ip6);
+    }
+    if let Some(ip6) = parse_ipv6_literal_net(host) {
+        return is_local_ipv6(ip6);
     }
     #[cfg(windows)]
-    if is_local_computer_name(host) {
-        return true;
+    {
+        is_local_computer_name(host)
     }
-    false
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn normalize_local_drive_prefix(raw: &str) -> Option<String> {
+    let replaced = raw.trim().replace('/', "\\");
+    let stripped = strip_namespace_prefix(&replaced);
+    let bytes = stripped.as_bytes();
+    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return None;
+    }
+    let drive = (bytes[0] as char).to_ascii_lowercase();
+    let rest = stripped[2..].trim_start_matches('\\');
+    let mut stack: Vec<String> = Vec::new();
+    for seg in rest.split('\\') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            stack.pop();
+            continue;
+        }
+        let cleaned = strip_ntfs_ads(seg).trim_end_matches([' ', '.']);
+        if !cleaned.is_empty() {
+            stack.push(cleaned.to_lowercase());
+        }
+    }
+    if stack.is_empty() {
+        Some(format!("{drive}:\\"))
+    } else {
+        Some(format!("{drive}:\\{}", stack.join("\\")))
+    }
+}
+
+fn resolve_system_root_norm() -> String {
+    for env_key in ["SystemRoot", "WINDIR"] {
+        if let Ok(val) = std::env::var(env_key) {
+            if let Some(norm) = normalize_local_drive_prefix(&val) {
+                return norm;
+            }
+        }
+    }
+    String::from("c:\\windows")
+}
+
+fn resolve_print_share_norm() -> String {
+    let sys_root = resolve_system_root_norm();
+    let base = sys_root.trim_end_matches('\\');
+    format!("{base}\\system32\\spool\\drivers")
+}
+
+#[cfg(windows)]
+struct NetApiBufferGuard(*mut u8);
+
+#[cfg(windows)]
+impl Drop for NetApiBufferGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                NetApiBufferFree(self.0.cast());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn resolve_local_hidden_share_path(server: &str, share: &str) -> Option<String> {
+    let share_wide = to_wide_null_str(share);
+    let mut buf_ptr: *mut u8 = std::ptr::null_mut();
+    let status = unsafe { NetShareGetInfo(std::ptr::null(), share_wide.as_ptr(), 2, &mut buf_ptr) };
+    let _guard = NetApiBufferGuard(buf_ptr);
+    if status == NO_ERROR && !buf_ptr.is_null() {
+        let info = unsafe { &*(buf_ptr as *const SHARE_INFO_2) };
+        if !info.shi2_path.is_null() {
+            let mut len = 0usize;
+            while len < 32768 && unsafe { *info.shi2_path.add(len) } != 0 {
+                len += 1;
+            }
+            if len > 0 {
+                let raw_path = String::from_utf16_lossy(unsafe {
+                    std::slice::from_raw_parts(info.shi2_path, len)
+                });
+                if let Some(norm) = normalize_local_drive_prefix(&raw_path) {
+                    return Some(norm);
+                }
+            }
+        }
+    }
+
+    let probe = format!("\\\\?\\UNC\\{server}\\{share}");
+    if let Some(resolved) = call_final_path_by_handle(&probe) {
+        if let Some(norm) = normalize_local_drive_prefix(&resolved) {
+            return Some(norm);
+        }
+    }
+
+    None
+}
+
+fn is_drive_share_bytes(share_bytes: &[u8]) -> bool {
+    share_bytes.len() == 2 && share_bytes[0].is_ascii_alphabetic() && share_bytes[1] == b'$'
 }
 
 fn split_windows_prefix(s: &str) -> (String, &str, bool) {
@@ -355,13 +548,23 @@ fn split_windows_prefix(s: &str) -> (String, &str, bool) {
             let server_lower = server.to_lowercase();
             let share_lower = share.to_lowercase();
             let share_bytes = share_lower.as_bytes();
-            if is_local_host_alias(server)
-                && share_bytes.len() == 2
-                && share_bytes[0].is_ascii_alphabetic()
-                && share_bytes[1] == b'$'
-            {
-                let drive = share_bytes[0] as char;
-                return (format!("{drive}:\\"), rest, true);
+            if is_local_host_alias(server) {
+                if is_drive_share_bytes(share_bytes) {
+                    let drive = share_bytes[0] as char;
+                    return (format!("{drive}:\\"), rest, true);
+                }
+                if share_lower == "admin$" {
+                    return (resolve_system_root_norm(), rest, true);
+                }
+                if share_lower == "print$" {
+                    return (resolve_print_share_norm(), rest, true);
+                }
+                #[cfg(windows)]
+                if share_lower.ends_with('$') {
+                    if let Some(local_root) = resolve_local_hidden_share_path(server, share) {
+                        return (local_root, rest, true);
+                    }
+                }
             }
             return (format!("\\\\{server_lower}\\{share_lower}"), rest, true);
         }
@@ -696,6 +899,10 @@ fn resolve_nt_or_volume_path_windows(replaced: &str, depth: u8) -> Option<String
                 if let Some(resolved) = resolve_nt_device_path(&nt_path) {
                     return Some(resolved);
                 }
+                if let Some(resolved) = resolve_via_final_path_handle(replaced) {
+                    return Some(resolved);
+                }
+                return try_local_mup_fallback(&nt_path);
             }
             return resolve_via_final_path_handle(replaced);
         }
@@ -729,6 +936,13 @@ fn resolve_nt_or_volume_path_windows(replaced: &str, depth: u8) -> Option<String
             && replaced.as_bytes()[..nt_prefix.len()].eq_ignore_ascii_case(nt_prefix.as_bytes())
         {
             let inner = &replaced[nt_prefix.len()..];
+            if inner
+                .as_bytes()
+                .get(..4)
+                .is_some_and(|h| h.eq_ignore_ascii_case(b"UNC\\"))
+            {
+                return Some(format!("\\\\{}", &inner[4..]));
+            }
             if is_drive_only(inner) || starts_with_drive_root(inner) {
                 return Some(inner.to_string());
             }
@@ -742,9 +956,41 @@ fn resolve_nt_or_volume_path_windows(replaced: &str, depth: u8) -> Option<String
             return Some(resolved);
         }
         let global_wrapped = format!("\\\\.\\GLOBALROOT{replaced}");
-        return resolve_via_final_path_handle(&global_wrapped);
+        if let Some(resolved) = resolve_via_final_path_handle(&global_wrapped) {
+            return Some(resolved);
+        }
+        return try_local_mup_fallback(replaced);
     }
 
+    None
+}
+
+#[cfg(windows)]
+fn try_local_mup_fallback(nt_path: &str) -> Option<String> {
+    const MUP_PREFIX: &str = "\\Device\\Mup\\";
+    if nt_path.len() <= MUP_PREFIX.len()
+        || !nt_path.as_bytes()[..MUP_PREFIX.len()].eq_ignore_ascii_case(MUP_PREFIX.as_bytes())
+    {
+        return None;
+    }
+    let mup_tail = &nt_path[MUP_PREFIX.len()..];
+    let (raw_server, after_server) = next_non_empty_unc_segment(mup_tail);
+    let (raw_share, _) = next_non_empty_unc_segment(after_server);
+    if raw_server.is_empty() || raw_server.starts_with(';') || raw_share.is_empty() {
+        return None;
+    }
+    let server = raw_server.trim_end_matches([' ', '.']);
+    let share = strip_ntfs_ads(raw_share).trim_end_matches([' ', '.']);
+    if !is_local_host_alias(server) {
+        return None;
+    }
+    let share_lower = share.to_lowercase();
+    if is_drive_share_bytes(share_lower.as_bytes())
+        || share_lower == "admin$"
+        || share_lower == "print$"
+    {
+        return Some(format!("\\\\{mup_tail}"));
+    }
     None
 }
 
@@ -897,7 +1143,13 @@ fn is_valid_deletable_target_norm(norm: &str) -> bool {
         let server = parts.next();
         let share = parts.next();
         let subpath = parts.next();
-        return server.is_some() && share.is_some() && subpath.is_some();
+        if let (Some(srv), Some(shr), Some(_)) = (server, share, subpath) {
+            if is_local_host_alias(srv) && shr.ends_with('$') {
+                return false;
+            }
+            return true;
+        }
+        return false;
     }
     false
 }
@@ -1328,5 +1580,183 @@ mod tests {
         assert!(!is_deletable_path(Path::new(r"\")));
         assert!(is_critical_system_path(Path::new(r"\Windows")));
         assert!(!is_deletable_path(Path::new(r"\Windows")));
+    }
+
+    #[test]
+    fn protects_local_admin_print_and_hidden_administrative_shares() {
+        let sys_root = resolve_system_root_norm();
+        let sys32 = format!("{sys_root}\\system32");
+        let print_root = resolve_print_share_norm();
+        let print_x64 = format!("{print_root}\\x64");
+
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\localhost\ADMIN$")),
+            sys_root
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\localhost\ADMIN$\System32")),
+            sys32
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\localhost\ADMIN$\..")),
+            sys_root
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\localhost\ADMIN$\..\Users")),
+            format!("{sys_root}\\users")
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\localhost\print$")),
+            print_root
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\localhost\print$\x64")),
+            print_x64
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\localhost\print$\..\..")),
+            print_root
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\DosDevices\UNC\127.0.0.2\ADMIN$\System32")),
+            sys32
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\GLOBAL??\UNC\127.0.0.2\ADMIN$\System32")),
+            sys32
+        );
+
+        let mut admin_cases = vec![
+            String::from(r"\\localhost\ADMIN$"),
+            String::from(r"\\localhost\ADMIN$\System32"),
+            String::from(r"\\localhost\ADMIN$\.."),
+            String::from(r"\\localhost\ADMIN$::$INDEX_ALLOCATION\System32"),
+            String::from(r"\\127.0.0.1\ADMIN$\System32"),
+            String::from(r"\\127.0.0.2\ADMIN$\System32"),
+            String::from(r"\\0--1.ipv6-literal.net\ADMIN$\System32"),
+            String::from(r"\\?\UNC\localhost\ADMIN$\System32"),
+            String::from(r"\\.\UNC\localhost\ADMIN$\System32"),
+            String::from(r"\??\UNC\localhost\ADMIN$\System32"),
+            String::from(r"\DosDevices\UNC\127.0.0.2\ADMIN$\System32"),
+            String::from(r"\GLOBAL??\UNC\127.0.0.2\ADMIN$\System32"),
+            String::from(r"\\.\GLOBALROOT\Device\Mup\localhost\ADMIN$\System32"),
+            String::from(r"\\localhost\print$"),
+            String::from(r"\\localhost\print$\x64"),
+            String::from(r"\\.\GLOBALROOT\Device\Mup\localhost\print$\x64"),
+        ];
+
+        if let Ok(comp) = std::env::var("COMPUTERNAME") {
+            let clean = comp.trim();
+            if !clean.is_empty() {
+                admin_cases.push(format!(r"\\{clean}\ADMIN$\System32"));
+                admin_cases.push(format!(r"\\{clean}\print$\x64"));
+            }
+        }
+
+        for case in &admin_cases {
+            assert!(
+                is_critical_system_path(Path::new(case)),
+                "expected critical system path for {case}"
+            );
+            assert!(
+                !is_deletable_path(Path::new(case)),
+                "expected non-deletable path for {case}"
+            );
+        }
+
+        // Unresolved local `$` administrative/hidden shares must fail closed
+        for local_hidden in [
+            r"\\localhost\IPC$",
+            r"\\localhost\IPC$\pipe",
+            r"\\127.0.0.1\IPC$\pipe",
+            r"\\localhost\NonExistentAdmin$\System32\item.bin",
+            r"\\127.0.0.2\CustomHidden$\folder\item.bin",
+        ] {
+            assert!(
+                !is_deletable_path(Path::new(local_hidden)),
+                "unresolved local hidden share must fail closed: {local_hidden}"
+            );
+        }
+
+        // Remote non-local `$` shares remain unaffected
+        assert!(!is_deletable_path(Path::new(r"\\RemoteServer\Hidden$")));
+        assert!(is_deletable_path(Path::new(
+            r"\\RemoteServer\Hidden$\Folder"
+        )));
+    }
+
+    #[test]
+    fn protects_non_loopback_local_nic_ip_admin_shares() {
+        let local_ips = query_local_unicast_ips();
+        let sys_root = resolve_system_root_norm();
+        let sys32 = format!("{sys_root}\\system32");
+
+        // Non-local documentation IP must not be treated as a local host alias
+        assert!(!is_local_host_alias("192.0.2.1"));
+        assert!(!is_local_host_alias("2001:db8::1"));
+        assert!(!is_critical_system_path(Path::new(
+            r"\\192.0.2.1\ADMIN$\System32"
+        )));
+
+        let mut non_loopback_v4: Option<Ipv4Addr> = None;
+        let mut non_loopback_v6: Option<Ipv6Addr> = None;
+        for ip in local_ips {
+            match ip {
+                IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => {
+                    if non_loopback_v4.is_none() {
+                        non_loopback_v4 = Some(v4);
+                    }
+                }
+                IpAddr::V6(v6) if !v6.is_loopback() && !v6.is_unspecified() => {
+                    if non_loopback_v6.is_none() {
+                        non_loopback_v6 = Some(v6);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(v4) = non_loopback_v4 {
+            assert!(is_local_host_alias(&v4.to_string()));
+            let c_win = format!(r"\\{v4}\C$\Windows");
+            let admin_sys32 = format!(r"\\{v4}\ADMIN$\System32");
+            let print_sub = format!(r"\\{v4}\print$\x64");
+            let ipc_sub = format!(r"\\{v4}\IPC$\pipe");
+
+            assert_eq!(normalize_windows_path(Path::new(&c_win)), r"c:\windows");
+            assert_eq!(normalize_windows_path(Path::new(&admin_sys32)), sys32);
+            for protected in [&c_win, &admin_sys32, &print_sub] {
+                assert!(
+                    is_critical_system_path(Path::new(protected)),
+                    "expected critical system path for local NIC IPv4 {protected}"
+                );
+                assert!(
+                    !is_deletable_path(Path::new(protected)),
+                    "expected non-deletable path for local NIC IPv4 {protected}"
+                );
+            }
+            assert!(!is_deletable_path(Path::new(&ipc_sub)));
+        }
+
+        if let Some(v6) = non_loopback_v6 {
+            let v6_str = v6.to_string();
+            assert!(is_local_host_alias(&v6_str));
+            let bracketed = format!("[{v6_str}]");
+            assert!(is_local_host_alias(&bracketed));
+            let c_win = format!(r"\\{bracketed}\C$\Windows");
+            let admin_sys32 = format!(r"\\{bracketed}\ADMIN$\System32");
+            assert_eq!(normalize_windows_path(Path::new(&c_win)), r"c:\windows");
+            assert_eq!(normalize_windows_path(Path::new(&admin_sys32)), sys32);
+            assert!(is_critical_system_path(Path::new(&c_win)));
+            assert!(!is_deletable_path(Path::new(&c_win)));
+            assert!(is_critical_system_path(Path::new(&admin_sys32)));
+            assert!(!is_deletable_path(Path::new(&admin_sys32)));
+
+            let ipv6_lit = format!("{}.ipv6-literal.net", v6_str.replace(':', "-"));
+            assert!(is_local_host_alias(&ipv6_lit));
+            let lit_admin = format!(r"\\{ipv6_lit}\ADMIN$\System32");
+            assert!(is_critical_system_path(Path::new(&lit_admin)));
+            assert!(!is_deletable_path(Path::new(&lit_admin)));
+        }
     }
 }

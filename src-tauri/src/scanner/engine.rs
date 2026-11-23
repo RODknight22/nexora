@@ -1318,4 +1318,53 @@ mod tests {
             "expected at least 5 live namespace targets to be verified, got {tested}"
         );
     }
+
+    #[test]
+    fn skips_local_admin_share_critical_paths_by_default() {
+        let mut admin_targets = vec![
+            String::from(r"\\localhost\ADMIN$"),
+            String::from(r"\\localhost\ADMIN$\System32"),
+            String::from(r"\\.\GLOBALROOT\Device\Mup\localhost\ADMIN$\System32"),
+        ];
+
+        if let Ok(comp) = std::env::var("COMPUTERNAME") {
+            let clean = comp.trim();
+            if !clean.is_empty() {
+                admin_targets.push(format!(r"\\{clean}\ADMIN$\System32"));
+            }
+        }
+
+        let mut tested = 0usize;
+        for target in admin_targets {
+            if std::fs::symlink_metadata(&target).is_err() {
+                continue;
+            }
+            tested += 1;
+            let res = scan_path(
+                String::from("test-admin-share"),
+                Path::new(&target),
+                ScanOptions {
+                    max_depth: Some(1),
+                    skip_protected: true,
+                    include_files: true,
+                },
+                Arc::new(AtomicBool::new(false)),
+                &NoopProgressSink,
+            )
+            .unwrap_or_else(|e| panic!("protected skip for '{target}' failed: {e}"));
+
+            assert!(res.root.is_protected, "expected isProtected for {target}");
+            assert!(!res.root.is_deletable, "expected !isDeletable for {target}");
+            assert!(
+                res.root.skipped_protected,
+                "expected skippedProtected for {target}"
+            );
+            assert_eq!(res.skipped_protected_count, 1);
+            assert!(res.root.children.is_empty());
+        }
+        assert!(
+            tested >= 3,
+            "expected at least 3 live ADMIN$ targets to be verified, got {tested}"
+        );
+    }
 }
