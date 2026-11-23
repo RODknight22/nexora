@@ -60,7 +60,7 @@ fn lexical_normalize_windows_str(raw: &str) -> String {
             }
             continue;
         }
-        let cleaned = segment.trim_end_matches([' ', '.']);
+        let cleaned = strip_ntfs_ads(segment).trim_end_matches([' ', '.']);
         if cleaned.is_empty() {
             continue;
         }
@@ -78,10 +78,26 @@ fn lexical_normalize_windows_str(raw: &str) -> String {
     }
 }
 
+fn strip_ntfs_ads(segment: &str) -> &str {
+    segment.split_once(':').map_or(segment, |(head, _)| head)
+}
+
+fn next_non_empty_unc_segment(input: &str) -> (&str, &str) {
+    let trimmed = input.trim_start_matches('\\');
+    match trimmed.find('\\') {
+        Some(idx) => (&trimmed[..idx], trimmed[idx..].trim_start_matches('\\')),
+        None => (trimmed, ""),
+    }
+}
+
 fn strip_namespace_prefix(s: &str) -> String {
     for prefix in ["\\\\?\\", "\\\\.\\", "\\??\\"] {
         if let Some(rest) = s.strip_prefix(prefix) {
-            if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("UNC\\") {
+            if rest
+                .as_bytes()
+                .get(..4)
+                .is_some_and(|head| head.eq_ignore_ascii_case(b"UNC\\"))
+            {
                 return format!("\\\\{}", &rest[4..]);
             }
             return rest.to_string();
@@ -100,11 +116,10 @@ fn split_windows_prefix(s: &str) -> (String, &str, bool) {
     }
 
     if let Some(unc_body) = s.strip_prefix("\\\\") {
-        let trimmed = unc_body.trim_start_matches('\\');
-        let mut parts = trimmed.splitn(3, '\\');
-        let server = parts.next().unwrap_or("").trim_end_matches([' ', '.']);
-        let share = parts.next().unwrap_or("").trim_end_matches([' ', '.']);
-        let rest = parts.next().unwrap_or("");
+        let (raw_server, after_server) = next_non_empty_unc_segment(unc_body);
+        let (raw_share, rest) = next_non_empty_unc_segment(after_server);
+        let server = raw_server.trim_end_matches([' ', '.']);
+        let share = strip_ntfs_ads(raw_share).trim_end_matches([' ', '.']);
         if !server.is_empty() && !share.is_empty() {
             let server_lower = server.to_lowercase();
             let share_lower = share.to_lowercase();
@@ -116,11 +131,11 @@ fn split_windows_prefix(s: &str) -> (String, &str, bool) {
                 && share_bytes[1] == b'$'
             {
                 let drive = share_bytes[0] as char;
-                return (format!("{drive}:\\"), rest.trim_start_matches('\\'), true);
+                return (format!("{drive}:\\"), rest, true);
             }
             return (format!("\\\\{server_lower}\\{share_lower}"), rest, true);
         }
-        return ("\\\\".to_string(), trimmed, true);
+        return ("\\\\".to_string(), unc_body.trim_start_matches('\\'), true);
     }
 
     if let Some(rest) = s.strip_prefix('\\') {
@@ -414,5 +429,84 @@ mod tests {
         let fallback = normalize_windows_path(Path::new(r"C:\NONEXI~1\Sub"));
         assert_eq!(fallback, r"c:\nonexi~1\sub");
         assert!(!is_critical_system_path(Path::new(r"C:\NONEXI~1\Sub")));
+    }
+
+    #[test]
+    fn normalizes_non_ascii_prefixed_paths_without_utf8_slicing_panic() {
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\?\C:\Árbol")),
+            r"c:\árbol"
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\.\C:\Óscar")),
+            r"c:\óscar"
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\??\D:\日本語")),
+            r"d:\日本語"
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\?\C:\Árbol\..")),
+            r"c:\"
+        );
+    }
+
+    #[test]
+    fn blocks_ntfs_ads_index_allocation_and_consecutive_unc_backslash_bypasses() {
+        assert_eq!(
+            normalize_windows_path(Path::new(r"C:\::$INDEX_ALLOCATION")),
+            r"c:\"
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"D:\::$INDEX_ALLOCATION")),
+            r"d:\"
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"C:\Windows::$INDEX_ALLOCATION")),
+            r"c:\windows"
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"\\.\C:\Windows::$INDEX_ALLOCATION")),
+            r"c:\windows"
+        );
+        assert_eq!(
+            normalize_windows_path(Path::new(r"C:\Program Files::$INDEX_ALLOCATION")),
+            r"c:\program files"
+        );
+
+        for critical_case in [
+            r"C:\::$INDEX_ALLOCATION",
+            r"C:\Windows::$INDEX_ALLOCATION",
+            r"\\.\C:\Windows::$INDEX_ALLOCATION",
+            r"C:\Program Files::$INDEX_ALLOCATION",
+            r"\\localhost\\C$\Windows",
+            r"\\?\UNC\localhost\\C$\Windows",
+            r"\\localhost\C$::$INDEX_ALLOCATION\Windows",
+        ] {
+            assert!(
+                is_critical_system_path(Path::new(critical_case)),
+                "expected critical system path for {critical_case}"
+            );
+            assert!(
+                !is_deletable_path(Path::new(critical_case)),
+                "expected non-deletable path for {critical_case}"
+            );
+        }
+
+        assert!(is_drive_root(Path::new(r"D:\::$INDEX_ALLOCATION")));
+        assert!(!is_deletable_path(Path::new(r"D:\::$INDEX_ALLOCATION")));
+
+        if Path::new(r"C:\PROGRA~1").exists() {
+            assert_eq!(
+                normalize_windows_path(Path::new(r"C:\PROGRA~1::$INDEX_ALLOCATION")),
+                r"c:\program files"
+            );
+            assert!(is_critical_system_path(Path::new(
+                r"C:\PROGRA~1::$INDEX_ALLOCATION"
+            )));
+            assert!(!is_deletable_path(Path::new(
+                r"C:\PROGRA~1::$INDEX_ALLOCATION"
+            )));
+        }
     }
 }

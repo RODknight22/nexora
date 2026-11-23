@@ -43,7 +43,10 @@ pub fn to_extended_length_path(path: &Path) -> OsString {
 }
 
 fn strip_unc_prefix(s: &str) -> Option<&str> {
-    if s.len() >= 4 && s[..4].eq_ignore_ascii_case("UNC\\") {
+    if s.as_bytes()
+        .get(..4)
+        .is_some_and(|head| head.eq_ignore_ascii_case(b"UNC\\"))
+    {
         Some(&s[4..])
     } else {
         None
@@ -120,6 +123,27 @@ pub fn join_extended_path(parent: &OsStr, child_name: &str) -> OsString {
     }
 }
 
+fn strip_ntfs_ads(segment: &str) -> &str {
+    segment.split_once(':').map_or(segment, |(head, _)| head)
+}
+
+fn next_non_empty_unc_segment(input: &str) -> (&str, &str) {
+    let trimmed = input.trim_start_matches('\\');
+    match trimmed.find('\\') {
+        Some(idx) => (&trimmed[..idx], trimmed[idx..].trim_start_matches('\\')),
+        None => (trimmed, ""),
+    }
+}
+
+fn clean_segment(segment: &str, trim_win32_trailing: bool) -> &str {
+    let without_ads = strip_ntfs_ads(segment);
+    if trim_win32_trailing {
+        without_ads.trim_end_matches([' ', '.'])
+    } else {
+        without_ads
+    }
+}
+
 fn lexical_clean_windows(raw: &str, trim_win32_trailing: bool) -> String {
     let bytes = raw.as_bytes();
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
@@ -134,11 +158,7 @@ fn lexical_clean_windows(raw: &str, trim_win32_trailing: bool) -> String {
                 stack.pop();
                 continue;
             }
-            let cleaned = if trim_win32_trailing {
-                seg.trim_end_matches([' ', '.'])
-            } else {
-                seg
-            };
+            let cleaned = clean_segment(seg, trim_win32_trailing);
             if cleaned.is_empty() {
                 continue;
             }
@@ -151,20 +171,14 @@ fn lexical_clean_windows(raw: &str, trim_win32_trailing: bool) -> String {
     }
 
     if let Some(unc) = raw.strip_prefix("\\\\") {
-        let mut parts = unc.trim_start_matches('\\').splitn(3, '\\');
-        let raw_server = parts.next().unwrap_or("");
-        let raw_share = parts.next().unwrap_or("");
+        let (raw_server, after_server) = next_non_empty_unc_segment(unc);
+        let (raw_share, rest) = next_non_empty_unc_segment(after_server);
         let server = if trim_win32_trailing {
             raw_server.trim_end_matches([' ', '.'])
         } else {
             raw_server
         };
-        let share = if trim_win32_trailing {
-            raw_share.trim_end_matches([' ', '.'])
-        } else {
-            raw_share
-        };
-        let rest = parts.next().unwrap_or("");
+        let share = clean_segment(raw_share, trim_win32_trailing);
         let mut stack: Vec<&str> = Vec::new();
         for seg in rest.split('\\') {
             if seg.is_empty() || seg == "." {
@@ -174,15 +188,17 @@ fn lexical_clean_windows(raw: &str, trim_win32_trailing: bool) -> String {
                 stack.pop();
                 continue;
             }
-            let cleaned = if trim_win32_trailing {
-                seg.trim_end_matches([' ', '.'])
-            } else {
-                seg
-            };
+            let cleaned = clean_segment(seg, trim_win32_trailing);
             if cleaned.is_empty() {
                 continue;
             }
             stack.push(cleaned);
+        }
+        if server.is_empty() {
+            return String::from("\\\\");
+        }
+        if share.is_empty() {
+            return format!("\\\\{server}");
         }
         if stack.is_empty() {
             return format!("\\\\{server}\\{share}");
@@ -255,6 +271,73 @@ mod tests {
         assert_eq!(
             to_extended_length_path(Path::new(r"C:\Windows.old")).to_string_lossy(),
             r"\\?\C:\Windows.old"
+        );
+    }
+
+    #[test]
+    fn handles_non_ascii_prefixed_paths_without_panicking() {
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\\?\C:\Árbol")).to_string_lossy(),
+            r"\\?\C:\Árbol"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\\.\C:\Óscar")).to_string_lossy(),
+            r"\\?\C:\Óscar"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\??\D:\日本語")).to_string_lossy(),
+            r"\\?\D:\日本語"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\\?\C:\Árbol\..")).to_string_lossy(),
+            r"\\?\C:\"
+        );
+    }
+
+    #[test]
+    fn strips_ntfs_ads_and_collapses_unc_separators() {
+        assert_eq!(
+            to_extended_length_path(Path::new(r"C:\::$INDEX_ALLOCATION")).to_string_lossy(),
+            r"\\?\C:\"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\\?\C:\::$INDEX_ALLOCATION")).to_string_lossy(),
+            r"\\?\C:\"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"D:\::$INDEX_ALLOCATION")).to_string_lossy(),
+            r"\\?\D:\"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"C:\Windows::$INDEX_ALLOCATION")).to_string_lossy(),
+            r"\\?\C:\Windows"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\\.\C:\Windows::$INDEX_ALLOCATION"))
+                .to_string_lossy(),
+            r"\\?\C:\Windows"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"C:\Program Files::$INDEX_ALLOCATION"))
+                .to_string_lossy(),
+            r"\\?\C:\Program Files"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"C:\PROGRA~1::$INDEX_ALLOCATION")).to_string_lossy(),
+            r"\\?\C:\PROGRA~1"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\\localhost\\C$\Windows")).to_string_lossy(),
+            r"\\?\UNC\localhost\C$\Windows"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\\?\UNC\localhost\\C$\Windows")).to_string_lossy(),
+            r"\\?\UNC\localhost\C$\Windows"
+        );
+        assert_eq!(
+            to_extended_length_path(Path::new(r"\\localhost\C$::$INDEX_ALLOCATION\Windows"))
+                .to_string_lossy(),
+            r"\\?\UNC\localhost\C$\Windows"
         );
     }
 

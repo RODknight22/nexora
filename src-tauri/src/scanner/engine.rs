@@ -1110,9 +1110,14 @@ mod tests {
             r"\??\C:\Windows",
             r"C:\Windows ",
             r"C:\Windows.",
+            r"C:\Windows::$INDEX_ALLOCATION",
+            r"\\.\C:\Windows::$INDEX_ALLOCATION",
+            r"\\?\C:\Windows::$INDEX_ALLOCATION",
+            r"C:\Program Files::$INDEX_ALLOCATION",
         ];
         if Path::new(r"C:\PROGRA~1").exists() {
             alias_paths.push(r"C:\PROGRA~1");
+            alias_paths.push(r"C:\PROGRA~1::$INDEX_ALLOCATION");
         }
 
         for raw in alias_paths {
@@ -1134,6 +1139,28 @@ mod tests {
             assert_eq!(res.skipped_protected_count, 1);
             assert!(res.root.children.is_empty());
         }
+    }
+
+    #[test]
+    fn scans_non_ascii_prefixed_paths_without_panicking() {
+        let dir = TempTestDir::new("unicode_prefix");
+        let arbol = dir.path().join("Árbol");
+        fs::create_dir_all(&arbol).expect("create unicode subdir");
+        write_bytes(&arbol.join("hoja.txt"), 512);
+
+        let prefixed = format!(r"\\?\{}", dir.path().display());
+        let res = scan_path(
+            String::from("test-unicode-prefix"),
+            Path::new(&prefixed),
+            ScanOptions::default(),
+            Arc::new(AtomicBool::new(false)),
+            &NoopProgressSink,
+        )
+        .expect("scan unicode prefixed temp dir");
+
+        assert_eq!(res.error_count, 0);
+        assert_eq!(res.file_count, 1);
+        assert_eq!(res.logical_size, 512);
     }
 
     #[test]
